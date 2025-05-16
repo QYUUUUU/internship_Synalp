@@ -11,22 +11,60 @@ from collections import defaultdict
 import torch.nn.utils.prune as prune
 from itertools import islice
 
-def resize_decoder_layer(layer, factor=4, layer_rank=None):
-    hidden_dim = layer.self_attn.q_proj.in_features  # Usually 896
-    attn_dim = layer.self_attn.k_proj.out_features   # Usually 128
-    reduced_attn_dim = attn_dim // factor
-    reduced_mlp_dim = layer.mlp.gate_proj.out_features // factor
+import torch.nn as nn
 
-    # Attention Projections
-    layer.self_attn.q_proj = torch.nn.Linear(hidden_dim, reduced_attn_dim, bias=True)
-    layer.self_attn.k_proj = torch.nn.Linear(hidden_dim, reduced_attn_dim, bias=True)
-    layer.self_attn.v_proj = torch.nn.Linear(hidden_dim, reduced_attn_dim, bias=True)
-    layer.self_attn.o_proj = torch.nn.Linear(reduced_attn_dim, hidden_dim, bias=False)
 
-    # MLP Projections
-    layer.mlp.gate_proj = torch.nn.Linear(hidden_dim, reduced_mlp_dim, bias=False)
-    layer.mlp.up_proj = torch.nn.Linear(hidden_dim, reduced_mlp_dim, bias=False)
-    layer.mlp.down_proj = torch.nn.Linear(reduced_mlp_dim, hidden_dim, bias=False)
+class Qwen2RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        """
+        Qwen2RMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+def shrink_linear(linear_layer, in_features, out_features):
+    new_layer = nn.Linear(in_features, out_features, bias=linear_layer.bias is not None)
+    with torch.no_grad():
+        # Get original dimensions
+        orig_out, orig_in = linear_layer.weight.shape
+
+        # Determine min dims to copy safely
+        copy_out = min(out_features, orig_out)
+        copy_in = min(in_features, orig_in)
+
+        new_layer.weight[:copy_out, :copy_in].copy_(linear_layer.weight[:copy_out, :copy_in])
+        if linear_layer.bias is not None and linear_layer.bias.shape[0] >= copy_out:
+            new_layer.bias[:copy_out].copy_(linear_layer.bias[:copy_out])
+    return new_layer
+
+
+def shrink_layer(layer, new_hidden_size, new_intermediate_size, new_num_heads):
+    head_dim = new_hidden_size // new_num_heads
+
+    # Attention projection resizing
+    layer.self_attn.q_proj = shrink_linear(layer.self_attn.q_proj, new_hidden_size, new_hidden_size)
+    layer.self_attn.k_proj = shrink_linear(layer.self_attn.k_proj, new_hidden_size, new_hidden_size // 4)
+    layer.self_attn.v_proj = shrink_linear(layer.self_attn.v_proj, new_hidden_size, new_hidden_size // 4)
+    layer.self_attn.o_proj = shrink_linear(layer.self_attn.o_proj, new_hidden_size, new_hidden_size)
+
+    # MLP resizing
+    layer.mlp.gate_proj = shrink_linear(layer.mlp.gate_proj, new_hidden_size, new_intermediate_size)
+    layer.mlp.up_proj = shrink_linear(layer.mlp.up_proj, new_hidden_size, new_intermediate_size)
+    layer.mlp.down_proj = shrink_linear(layer.mlp.down_proj, new_intermediate_size, new_hidden_size)
+
+    layer.input_layernorm = Qwen2RMSNorm(new_hidden_size, eps=1e-6)
+    layer.post_attention_layernorm = Qwen2RMSNorm(new_hidden_size, eps=1e-6)
 
     return layer
 
@@ -77,25 +115,42 @@ if __name__ == "__main__":
     )
 
     print(reordered_list)
-    
     original_layers = model.model.layers
+
     new_layers = torch.nn.ModuleList()
+    
+    new_hidden_size = 448
+    new_intermediate_size = 1792
+    new_num_heads = model.config.num_attention_heads
+
     
     for idx, (layer_id, _) in enumerate(reordered_list):
         layer = original_layers[int(layer_id)]
-
-        if idx == 0:
-            resized_layer = resize_decoder_layer(layer, factor=4, layer_rank="First")
-        elif idx == len(reordered_list) - 1:
-            resized_layer = resize_decoder_layer(layer, factor=4, layer_rank="Last")
-        else:
-            resized_layer = resize_decoder_layer(layer, factor=4)
-
-
-        new_layers.append(resized_layer)
+        new_layers.append(shrink_layer(layer, new_hidden_size, new_intermediate_size, new_num_heads))
 
     device = next(model.parameters()).device
     model.model.layers = new_layers.to(device)
+
+    # === Resize Embedding, Norm, and LM Head ===
+    vocab_size = model.model.embed_tokens.num_embeddings
+    
+    # Resize embedding layer
+    old_embed = model.model.embed_tokens
+    new_embed = nn.Embedding(vocab_size, new_hidden_size)
+    with torch.no_grad():
+        new_embed.weight[:, :new_hidden_size].copy_(old_embed.weight[:, :new_hidden_size])
+    model.model.embed_tokens = new_embed.to(device)
+    
+    # Resize final norm
+    model.model.norm = Qwen2RMSNorm(new_hidden_size, eps=1e-6).to(device)
+    
+    # Resize LM head
+    old_lm_head = model.lm_head
+    model.lm_head = nn.Linear(new_hidden_size, vocab_size, bias=False)
+    with torch.no_grad():
+        model.lm_head.weight[:, :new_hidden_size].copy_(old_lm_head.weight[:, :new_hidden_size])
+    model.lm_head = model.lm_head.to(device)
+
     print(model)
 
     print(model_evaluation(model, eval_dataset, 1))
