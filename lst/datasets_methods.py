@@ -80,11 +80,11 @@ def get_train_eval_datasets(tokenizer):
 
     
     def formatting_train_func(row):
-        prompt = f'{row["premise"]} \nQuestion: {row["hypothesis"]} \nTrue, False or Neither?\nAnswer:'
+        prompt = f'{row["premise"]} \nQuestion: {row["hypothesis"]}\n True, False or Neither?\nAnswer:'
         label = get_label(row["label"])
     
         messages = [
-            {"role": "system", "content": "You are gpt2, created by OpenAI. You are a helpful assistant."},
+            {"role": "system", "content": "You are Qwen, created by Alibaba. You are a helpful assistant."},
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": label}
         ]
