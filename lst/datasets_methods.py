@@ -60,24 +60,16 @@ def preprocess_sft_batch(text_list, template_text, tokenizer, max_length=512):
     return processed
     
 
-def get_train_eval_datasets(tokenizer):
+def get_train_eval_datasets(tokenizer, train_data_points=500, eval_data_points=100, max_length=512):
     
     dataset = load_dataset("glue", "mnli")
     
     df_train = dataset["train"].to_pandas()
     df_test_matched = dataset["test_matched"].to_pandas()
     
-    # First 2000 random rows
-    df_small_train = df_train.sample(n=500, random_state=99)
+    df_small_train = df_train.sample(n=train_data_points, random_state=99)
     
-    
-    # Then sample 200 *others* by excluding the above indices
-    df_small_eval = df_test_matched.sample(n=100, random_state=99)
-    
-    # Done!
-    print("First sample (many rows):", df_small_train.shape)
-    print("Second sample (200 rows, no overlap):", df_small_eval.shape)
-
+    df_small_eval = df_test_matched.sample(n=eval_data_points, random_state=99)
     
     def formatting_train_func(row):
         prompt = f'{row["premise"]} \nQuestion: {row["hypothesis"]}\n True, False or Neither?\nAnswer:'
@@ -117,7 +109,7 @@ def get_train_eval_datasets(tokenizer):
         df_small_train["text"],
         response_template,
         tokenizer,
-        max_length=1024  # or whatever fits your model
+        max_length=max_length  # or whatever fits your model
     )
     
     print(processed_small_train[0])  # check first sample

@@ -12,7 +12,8 @@ from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, Ti
 from rich.layout import Layout
 from cut_cross_entropy import linear_cross_entropy
 import copy
-from transformers.models.qwen2.modelin_qwen2 import Qwen2DecoderLayer
+from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+from model_methods import get_model_tokenizer, train_loop
 
 
 class LadderSideNetwork(nn.Module):
@@ -42,13 +43,13 @@ class LadderSideNetwork(nn.Module):
         self.layer_id_map = {}  # maps safe_name -> original layer_id
 
             
-        print(model.config)
+        #print(self.main_model.config)
     
-        copied_config = copy.deepcopy(model.config)
+        #copied_config = copy.deepcopy(self.main_model.config)
     
     
-        copied_config.hidden_size = 496
-        copied_config.num_attention_heads = 8
+        #copied_config.hidden_size = 496
+        #copied_config.num_attention_heads = 8
 
         
 
@@ -60,13 +61,13 @@ class LadderSideNetwork(nn.Module):
 
             self.side_layers[safe_name] = copy.deepcopy(target_layer)
             
-            print(self.side_layers[safe_name].hidden_size)
+            #print(self.side_layers[safe_name].hidden_size)
             
-            self.side_layers[safe_name].hidden_size = 486
+            #self.side_layers[safe_name].hidden_size = 486
             
-            print(self.side_layers[safe_name].hidden_size)
+            #print(self.side_layers[safe_name].hidden_size)
             
-            print(self.side_layers[safe_name])
+            #print(self.side_layers[safe_name])
 
 
         self.fusion_layer_id = tapped_layer_ids[-1]
@@ -114,7 +115,7 @@ class LadderSideNetwork(nn.Module):
         fused_output = final_hidden_state + side_output
       
         # Project through LLM head
-        logits = self.main_model.lm_head(final_hidden_state)
+        logits = self.main_model.lm_head(fused_output)
         
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
@@ -146,104 +147,17 @@ class LadderSideNetwork(nn.Module):
             generated = torch.argmax(logits, dim=-1)
 
         return generated
-
-    def evaluate(self, eval_dataset, eval_batch_size, device, tokenizer, max_new_tokens=1):
-        self.eval()
-        dataloader = DataLoader(eval_dataset, batch_size=eval_batch_size)
     
-        correct = 0
-        total = 0
-    
-        with torch.no_grad():
-            for batch in dataloader:
-                full_input_ids = batch["input_ids"].to(device)  # contains both prompt + label
-                full_labels = batch["labels"].to(device)        # labels padded with -100
-    
-                # Detect prompt end by finding first non--100 in labels
-                prompt_lengths = (full_labels != -100).float().argmax(dim=1)  # shape: [batch_size]
-    
-                for i in range(full_input_ids.size(0)):
-                    prompt_len = prompt_lengths[i].item()
-                    prompt_input_ids = full_input_ids[i, :prompt_len].unsqueeze(0)  # [1, prompt_len]
-    
-                    # Generate from prompt only
-                    generated = self.generate(prompt_input_ids, max_new_tokens=max_new_tokens)
-
-                    
-                    generated_tokens = generated[0][-1]  # skip prompt
-
-                    
-                    # Decode
-                    decoded_output = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
-                    target_ids = full_labels[i][full_labels[i] != -100]
-                    decoded_label = tokenizer.decode(target_ids, skip_special_tokens=True).strip()
-
-                    #print("Decoded output:",decoded_output)
-                    #print("Decoded label:",decoded_label)
-                    #print("\n")
-    
-                    if any(x in decoded_output.lower() for x in ["true", "false", "neither"]):
-                        if ("true" in decoded_output.lower() and "true" in decoded_label.lower()) or \
-                           ("false" in decoded_output.lower() and "false" in decoded_label.lower()) or \
-                           ("neither" in decoded_output.lower() and "neither" in decoded_label.lower()):
-                            correct += 1
-    
-                    total += 1
-    
-        self.train()
-        return (correct / total) * 100 if total > 0 else 0.0
-    
-    def train_loop(self, epochs, batch_size, optimizer, train_dataset, eval_dataset, logging_steps, evaluation_steps, eval_batch_size, tokenizer):
-        from torch.utils.data import DataLoader
-    
-        train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        step_count = 0
-    
-        table = Table(title="Training Log")
-        table.add_column("Step", justify="right")
-        table.add_column("Epoch")
-        table.add_column("Loss", justify="right")
-        table.add_column("Accuracy", justify="right")
-    
-        progress = Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            "[progress.percentage]{task.percentage:>3.1f}%",
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-        )
-        progress_task_id = progress.add_task("Training", total=len(train_dataloader) * epochs)
-    
-        layout = Layout()
-        layout.split_column(
-            Layout(progress, name="progress", size=3),
-            Layout(table, name="table")
-        )
-    
-        with Live(layout, refresh_per_second=4):
-            for epoch in range(epochs):
-                total_loss = 0
-                for batch in train_dataloader:
-                    self.train()  # will only unfreeze side layers
-    
-                    input_ids = batch["input_ids"].to(next(self.parameters()).device)
-                    labels = batch["labels"].to(next(self.parameters()).device)
-    
-                    outputs = self(input_ids=input_ids, labels=labels)
-                    loss = outputs.loss
-    
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-    
-                    step_count += 1
-                    total_loss += loss.item()
-                    progress.update(progress_task_id, advance=1)
-    
-                    if step_count % logging_steps == 0:
-                        accuracy = self.evaluate(eval_dataset, eval_batch_size=1, device=device, tokenizer=tokenizer)
-                        accuracy = str(accuracy)+"%"
-                        table.add_row(str(step_count), str(epoch + 1), f"{loss.item():.4f}",accuracy)
-    
-                avg_loss = total_loss / len(train_dataloader)
-                print(f"[green]Epoch {epoch+1} finished — Avg Loss: {avg_loss:.4f}[/green]")
+    def fine_tuning(self, epochs, batch_size, optimizer, train_dataset, eval_dataset, logging_steps, evaluation_steps, eval_batch_size, tokenizer):
+        train_loop(model= self,
+            epochs= epochs,
+            batch_size= batch_size,
+            optimizer= optimizer,
+            train_dataset= train_dataset,
+            eval_dataset=eval_dataset,
+            logging_steps= logging_steps,
+            evaluation_steps= evaluation_steps,
+            eval_batch_size= eval_batch_size,
+            model_type="Ladder",
+            tokenizer=tokenizer
+            )

@@ -116,9 +116,7 @@ def select_most_important_layers(
     for layer_num, fisher in reordered_list:
         pruned_layers_names.append("model.layers."+layer_num)
     
-    original_layers = model.model.layers
-
-    return pruned_layers_names
+    return pruned_layers_names, reordered_list
 
 
 def plot_layer_importance(sorted_items, save_path: str = "./layer_importance.png"):
