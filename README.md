@@ -1,4 +1,4 @@
-# Méthodes efficaces d’apprentissage pour l’adaptation des modèles de langue
+# Efficient Fine-Tuning Techniques for Language Model Adaptation
 
 ## Acknowledgements
 
